@@ -10,6 +10,7 @@ _early_os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "0")
 import logging, os, sys, json, argparse
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from collections import defaultdict
 from functools import lru_cache
 from contextlib import contextmanager
 
@@ -17,13 +18,6 @@ import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-
-try:
-    from absl import logging as absl_logging
-    absl_logging.set_verbosity(absl_logging.ERROR)
-except Exception:
-    pass
-
 import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
@@ -50,16 +44,12 @@ if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set (.env or environment).")
 
 genai.configure(api_key=GEMINI_API_KEY)
-log.info("Config → ETH_RPC_URL set: %s | GEMINI_MODEL: %s", bool(ETH_RPC_URL), GEMINI_MODEL)
 
 def rpc(method: str, params: List[Any]) -> Dict[str, Any]:
     payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
-    try:
-        r = requests.post(ETH_RPC_URL, json=payload, timeout=50)
-        r.raise_for_status()
-        data = r.json()
-    except requests.RequestException as e:
-        raise RuntimeError(f"RPC network error: {e}")
+    r = requests.post(ETH_RPC_URL, json=payload, timeout=50)
+    r.raise_for_status()
+    data = r.json()
     if "error" in data:
         raise RuntimeError(f"RPC error: {data['error']}")
     return data.get("result")
@@ -83,8 +73,7 @@ def safe_int(val: Any, default: int = 0) -> int:
     except Exception:
         return default
 
-app = FastAPI(title="Tx Risk Triage (Steps 1–6)", version="0.1")
-
+app = FastAPI(title="Tx Risk Triage", version="0.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -135,14 +124,152 @@ def get_erc20_metadata(token_address: str) -> Dict[str, Optional[Any]]:
         sym = sym.replace("\x00", "")
     return {"symbol": sym, "decimals": _decode_uint256(decimals_hex)}
 
-if __name__ == "__main__":
-    print("[health]", {"status": "ok"})
+TRANSFER_SIG = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+APPROVAL_SIG = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
+MAX_UINT256  = int("f"*64, 16)
+
+def decode_erc20_logs(receipt: Dict[str, Any]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for lg in (receipt.get("logs", []) or []):
+        topics = [str(t).lower() for t in (lg.get("topics") or [])]
+        if not topics:
+            continue
+        t0 = topics[0]
+        token = (lg.get("address") or "").lower()
+        if not token:
+            continue
+        meta = get_erc20_metadata(token)
+        symbol, decimals = meta.get("symbol"), meta.get("decimals")
+        if t0 == TRANSFER_SIG and len(topics) >= 3:
+            events.append({
+                "type": "Transfer",
+                "contract": token,
+                "from": to_address(topics[1]),
+                "to": to_address(topics[2]),
+                "value": hex_to_int_str(lg.get("data")),
+                "logIndex": lg.get("logIndex"),
+                "txIndex": lg.get("transactionIndex"),
+                "symbol": symbol,
+                "decimals": decimals,
+            })
+        elif t0 == APPROVAL_SIG and len(topics) >= 3:
+            vstr = hex_to_int_str(lg.get("data"))
+            is_inf, near_inf = False, False
+            try:
+                iv = int(vstr)
+                is_inf = iv >= MAX_UINT256
+                near_inf = iv >= MAX_UINT256 - 10
+            except Exception:
+                pass
+            events.append({
+                "type": "Approval",
+                "contract": token,
+                "owner": to_address(topics[1]),
+                "spender": to_address(topics[2]),
+                "value": vstr,
+                "is_infinite": is_inf,
+                "is_near_infinite": near_inf,
+                "logIndex": lg.get("logIndex"),
+                "txIndex": lg.get("transactionIndex"),
+                "symbol": symbol,
+                "decimals": decimals,
+            })
+    for ev in events:
+        try:
+            dec = ev.get("decimals")
+            if dec is not None:
+                ev["value_float"] = int(ev["value"]) / (10 ** int(dec))
+        except Exception:
+            pass
+    return events
+
+def canonical_json(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+def _hex_to_int_safe(h: str) -> int:
     try:
-        print("[rpc] eth_blockNumber →", rpc("eth_blockNumber", []))
-    except Exception as e:
-        print("[rpc] failed:", e)
-    usdc = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
-    try:
-        print("[erc20]", get_erc20_metadata(usdc))
-    except Exception as e:
-        print("[erc20] failed:", e)
+        return int(h, 16)
+    except Exception:
+        return -1
+
+def canonicalize_event(ev: dict) -> Dict[str, Any]:
+    out = {
+        "type": str(ev.get("type","")),
+        "contract": str(ev.get("contract","")).lower(),
+        "logIndex": str(ev.get("logIndex","")),
+        "txIndex": str(ev.get("txIndex","")),
+    }
+    if out["type"] == "Transfer":
+        out |= {
+            "from": str(ev.get("from","")).lower(),
+            "to": str(ev.get("to","")).lower(),
+            "value": str(ev.get("value","0"))
+        }
+    elif out["type"] == "Approval":
+        out |= {
+            "owner": str(ev.get("owner","")).lower(),
+            "spender": str(ev.get("spender","")).lower(),
+            "value": str(ev.get("value","0")),
+            "is_infinite": bool(ev.get("is_infinite", False)),
+            "is_near_infinite": bool(ev.get("is_near_infinite", False))
+        }
+    if isinstance(ev.get("decimals"), int):
+        out["decimals"] = ev["decimals"]
+    if isinstance(ev.get("symbol"), str):
+        out["symbol"] = ev["symbol"].replace("\x00","")
+    return out
+
+def canonicalize_events(events: List[dict]) -> List[dict]:
+    return sorted([canonicalize_event(e) for e in events],
+                  key=lambda e: _hex_to_int_safe(e.get("logIndex","")))
+
+def canonicalize_tx_meta(tx_meta: dict) -> dict:
+    return {
+        "hash": str(tx_meta.get("hash","")),
+        "from": str(tx_meta.get("from","")).lower(),
+        "to": str(tx_meta.get("to","")).lower(),
+        "blockNumber": str(tx_meta.get("blockNumber","")),
+        "status": str(tx_meta.get("status","")),
+    }
+
+def canonicalize_hints(hints: List[str]) -> List[str]:
+    return sorted({h.strip() for h in hints if isinstance(h,str) and h.strip()})
+
+MAX_EVENTS_FOR_PROMPT, PROMPT_HEAD, PROMPT_TAIL = 120, 80, 40
+
+def build_stable_facts(tx_meta: dict, decoded_events: List[dict], hints: Optional[List[str]] = None) -> str:
+    norm_events = canonicalize_events(decoded_events)
+    truncated = False
+    if len(norm_events) > MAX_EVENTS_FOR_PROMPT:
+        truncated = True
+        norm_events = norm_events[:PROMPT_HEAD] + norm_events[-PROMPT_TAIL:]
+    facts = {"tx_meta": canonicalize_tx_meta(tx_meta), "decoded_events": norm_events}
+    if hints:
+        facts["heuristic_hints"] = canonicalize_hints(hints)
+    if truncated:
+        facts["__prompt_note"] = {
+            "truncated": True,
+            "original_event_count": len(decoded_events),
+            "included_event_count": len(norm_events),
+            "sampling": f"head:{PROMPT_HEAD}, tail:{PROMPT_TAIL}"
+        }
+    return canonical_json(facts)
+
+def build_llm_prompt(tx_meta: Dict[str, Any], decoded_events: List[Dict[str, Any]], hints: Optional[List[str]]=None) -> str:
+    schema = (
+        'Return ONE JSON object with EXACTLY these keys:\n'
+        '{"risk_level":"low|suspicious|high","confidence":<0..1>,'
+        '"factors_triggered":["<string>",...],"rationale":"<<=280 chars>"}\n'
+        'Rules:\n- Output MUST be valid JSON.\n- Only the keys above.\n'
+        '- If "heuristic_hints" exists, include at least one accurate hint.\n'
+        '- IMPORTANT: Return MINIFIED JSON.'
+    )
+    good = ('Example (GOOD):\n'
+            '{"risk_level":"high","confidence":0.92,'
+            '"factors_triggered":["infinite approval","known phishing spender"],'
+            '"rationale":"MAX_UINT256 approval to 0xabc...; spender has phishing history."}')
+    return ("You are a blockchain security triage assistant.\nBe precise, skeptical, and deterministic.\n\n"
+            f"{schema}\n\n{good}\n\n"
+            "Now assess the following transaction facts (JSON):\n"
+            f"{build_stable_facts(tx_meta, decoded_events, hints)}\n\n"
+            "Respond with MINIFIED JSON only. No prose.")
