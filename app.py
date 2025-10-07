@@ -273,3 +273,60 @@ def build_llm_prompt(tx_meta: Dict[str, Any], decoded_events: List[Dict[str, Any
             "Now assess the following transaction facts (JSON):\n"
             f"{build_stable_facts(tx_meta, decoded_events, hints)}\n\n"
             "Respond with MINIFIED JSON only. No prose.")
+
+def normalize_risk_assessment(raw: Dict[str, Any]) -> Dict[str, Any]:
+    result = {"risk_level":"low","confidence":0.5,"factors_triggered":[],"rationale":"No assessment."}
+    if not isinstance(raw, dict):
+        return result
+    rl = str(raw.get("risk_level","low")).lower()
+    if rl not in {"low","suspicious","high"}:
+        rl = "low"
+    result["risk_level"] = rl
+    try:
+        cf = float(raw.get("confidence",0.5))
+        result["confidence"] = max(0.0,min(1.0,cf))
+    except Exception:
+        pass
+    ft = raw.get("factors_triggered",[])
+    if isinstance(ft,list):
+        result["factors_triggered"] = [str(x) for x in ft if isinstance(x,(str,int,float))]
+    result["rationale"] = str(raw.get("rationale") or "")[:280]
+    return result
+
+def heuristic_risk_fallback(tx_meta: Dict[str, Any], events: List[Dict[str, Any]], hints: List[str]) -> Dict[str, Any]:
+    high = any("infinite" in (h or "").lower() for h in (hints or []))
+    susp = any(("fan-out" in (h or "").lower()) or ("multiple approvals" in (h or "").lower()) for h in (hints or []))
+    risk_level, confidence = ("high",0.85) if high else (("suspicious",0.7) if susp else ("low",0.6))
+    rationale_bits = []
+    if hints:
+        rationale_bits.append("; ".join(hints[:3]))
+    if not rationale_bits:
+        rationale_bits.append("Heuristic only (LLM unavailable).")
+    return {"risk_level":risk_level,"confidence":confidence,"factors_triggered":(hints or [])[:3],
+            "rationale":(". ".join(rationale_bits))[:280]}
+
+def call_gemini_for_risk(tx_meta: Dict[str, Any], decoded_events: List[Dict[str, Any]], heuristic_hints: Optional[List[str]]=None) -> Dict[str, Any]:
+    prompt_text = build_llm_prompt(tx_meta, decoded_events, heuristic_hints)
+    model = genai.GenerativeModel(
+        GEMINI_MODEL,
+        generation_config={"response_mime_type":"application/json","temperature":0.0,"candidate_count":1},
+    )
+    timeouts = [60, 120, 180]
+    last_err: Optional[Exception] = None
+    for t in timeouts:
+        try:
+            try:
+                resp = model.generate_content(prompt_text, request_options={"timeout": t})
+            except TypeError:
+                resp = model.generate_content(prompt_text)
+            content = (resp.text or "").strip()
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                s,e = content.find("{"), content.rfind("}")
+                parsed = json.loads(content[s:e+1]) if s!=-1 and e!=-1 and e>s else {}
+            return normalize_risk_assessment(parsed)
+        except Exception as e:
+            last_err = e
+            log.warning("Gemini attempt with timeout=%ss failed: %s", t, e)
+    raise RuntimeError(f"Gemini generate_content failed after retries: {last_err}")
