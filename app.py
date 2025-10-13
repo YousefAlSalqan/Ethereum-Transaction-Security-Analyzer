@@ -330,3 +330,44 @@ def call_gemini_for_risk(tx_meta: Dict[str, Any], decoded_events: List[Dict[str,
             last_err = e
             log.warning("Gemini attempt with timeout=%ss failed: %s", t, e)
     raise RuntimeError(f"Gemini generate_content failed after retries: {last_err}")
+
+def aggregate_totals_by_token(events: List[Dict[str, Any]], pov_address: Optional[str]) -> Dict[str, Any]:
+    totals: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"in":0,"out":0,"symbol":None,"decimals":None})
+    pov = (pov_address or "").lower() if pov_address else None
+    for ev in events:
+        if ev.get("type") != "Transfer":
+            continue
+        token = ev.get("contract")
+        if not token:
+            continue
+        val = safe_int(ev.get("value"), 0)
+        sym = ev.get("symbol")
+        dec = ev.get("decimals")
+        if sym and not totals[token]["symbol"]:
+            totals[token]["symbol"] = sym
+        if (dec is not None) and (totals[token]["decimals"] is None):
+            totals[token]["decimals"] = dec
+        if pov:
+            if (ev.get("to") or "").lower() == pov:
+                totals[token]["in"]  += val
+            elif (ev.get("from") or "").lower() == pov:
+                totals[token]["out"] += val
+            else:
+                totals[token]["out"] += val
+        else:
+            totals[token]["out"] += val
+    return {tok: {"in": str(t["in"]), "out": str(t["out"]), "symbol": t["symbol"], "decimals": t["decimals"]}
+            for tok,t in totals.items()}
+
+def generate_heuristic_hints(events: List[Dict[str, Any]]) -> List[str]:
+    hints=[]
+    for ev in events:
+        if ev.get("type")=="Approval" and ev.get("is_near_infinite"):
+            hints.append(f"Near-infinite approval on {ev.get('contract')} to {ev.get('spender')}")
+    approvals=[e for e in events if e.get("type")=="Approval"]
+    if len(approvals)>1:
+        hints.append("Multiple approvals within one transaction")
+    tos={e.get("to") for e in events if e.get("type")=="Transfer"}
+    if len(tos)>5:
+        hints.append("High recipient fan-out (complex routing)")
+    return canonicalize_hints(hints)
